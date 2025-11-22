@@ -1,4 +1,4 @@
-Artemis Engine
+**Artemis Engine**
 
 Artemis Engine is a sophisticated, institutional-grade trading analysis platform built with Python. It combines real-time market data, advanced technical indicators, and deep learning models to provide actionable financial insights.
 
