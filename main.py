@@ -1,3 +1,9 @@
+import os
+import base64
+# --- 1. Silence TensorFlow & Protobuf Warnings ---
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import messagebox
@@ -7,6 +13,7 @@ import pandas as pd
 import numpy as np
 import pandas_ta as ta
 import requests
+from io import StringIO
 from xml.etree import ElementTree
 import warnings
 import traceback
@@ -14,58 +21,153 @@ import sys
 import logging
 from queue import Queue, Empty
 import configparser
-import os
-import json
 import random
-import math
-
-# --- Logging Setup ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s',
-    filename='artemis_engine.log',
-    filemode='w'
-)
+import concurrent.futures
+import webbrowser
+from datetime import datetime
 
 # --- Library Import & Setup ---
 warnings.filterwarnings("ignore")
-logging.info("Libraries imported and warnings suppressed.")
 
-import matplotlib
-matplotlib.use("TkAgg")
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import mplfinance as mpf
-from sklearn.linear_model import LinearRegression
+# --- Logging Setup ---
+handlers = [
+    logging.FileHandler('artemis_engine.log', mode='w'),
+    logging.StreamHandler(sys.stdout)
+]
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s',
+    handlers=handlers
+)
+
+logging.info("Imports started...")
+
+# Import the bridge
+try:
+    from prediction_engine import PredictionEngine
+except ImportError:
+    logging.error("Could not import prediction_engine.py. Ensure it is in the same directory.")
+    PredictionEngine = None
+
+# --- Global Variable for the AI Engine ---
+PredictionEngineClass = None
+
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import mplfinance as mpf
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Rectangle
+    logging.info("Visualization libraries loaded.")
+except ImportError as e:
+    logging.critical(f"Missing library: {e}")
+    messagebox.showerror("Missing Library", f"Critical library missing: {e}\nPlease run: pip install -r requirements.txt")
+    sys.exit(1)
+
+# Try importing OpenAI
+try:
+    from openai import OpenAI
+    AI_LIB_AVAILABLE = True
+    AI_IMPORT_ERROR = None
+except ImportError as e:
+    AI_LIB_AVAILABLE = False
+    AI_IMPORT_ERROR = str(e)
+    logging.warning(f"OpenAI library not found: {e}")
 
 # =================================================================================================
-# CONFIGURATION
+# CONFIGURATION & SECURITY
 # =================================================================================================
 class Config:
     VALID_KEY = "ARTEMIS-2025"
     APP_NAME = "Artemis Engine"
     CONFIG_FILE = "artemis.cfg"
-    INDICES = {"S&P 500": "^GSPC", "NASDAQ": "^IXIC", "Dow Jones": "^DJI"}
+    
+    # --- ENCRYPTED TOKEN STORAGE ---
+    _ENC_TOKEN = "Z2l0aHViX3BhdF8xMUJHTlJENlkwQU9yUWw1OXVUdnVmX0R6UXNDNllUSXZxeUdiSTZHMGZjWXZsM1I2TGtyOW1zOXdjNkxBTXRqS0hLREU2UjdUQkJsN1VybHpM"
+    
+    @staticmethod
+    def get_ai_token():
+        try:
+            return base64.b64decode(Config._ENC_TOKEN).decode('utf-8')
+        except Exception:
+            return ""
+
+    # Expanded Pool of Stocks
+    STOCK_MAP = {
+        "AAPL": "Apple Inc.", "MSFT": "Microsoft Corp", "GOOGL": "Alphabet Inc.", "AMZN": "Amazon.com", 
+        "NVDA": "NVIDIA Corp", "TSLA": "Tesla Inc.", "META": "Meta Platforms", "AMD": "Adv. Micro Devices",
+        "NFLX": "Netflix Inc.", "INTC": "Intel Corp", "IBM": "IBM Corp", "ORCL": "Oracle Corp", 
+        "CSCO": "Cisco Systems", "QCOM": "Qualcomm Inc.", "TXN": "Texas Instruments", "AVGO": "Broadcom Inc.",
+        "JPM": "JPMorgan Chase", "BAC": "Bank of America", "WMT": "Walmart Inc.", "PG": "Procter & Gamble", 
+        "JNJ": "Johnson & Johnson", "XOM": "Exxon Mobil", "CVX": "Chevron Corp", "KO": "Coca-Cola Co.",
+        "PEP": "PepsiCo Inc.", "COST": "Costco Wholesale", "HD": "Home Depot", "MCD": "McDonald's",
+        "DIS": "Walt Disney Co.", "NKE": "Nike Inc.", "V": "Visa Inc.", "MA": "Mastercard",
+        "PYPL": "PayPal Holdings", "ADBE": "Adobe Inc.", "CRM": "Salesforce", "ABNB": "Airbnb Inc.",
+        "UBER": "Uber Tech", "SPOT": "Spotify Tech", "SQ": "Block Inc.", "COIN": "Coinbase Global",
+        "PLTR": "Palantir Tech", "SOFI": "SoFi Tech", "RIVN": "Rivian Auto", "LCID": "Lucid Group",
+        "F": "Ford Motor Co.", "GM": "General Motors", "GE": "General Electric", "BA": "Boeing Co.",
+        "CAT": "Caterpillar", "MMM": "3M Company", "HON": "Honeywell", "UNH": "UnitedHealth",
+        "LLY": "Eli Lilly", "PFE": "Pfizer Inc.", "MRK": "Merck & Co.", "ABBV": "AbbVie Inc.",
+        "T": "AT&T Inc.", "VZ": "Verizon", "TMUS": "T-Mobile US", "CMCSA": "Comcast Corp",
+        "GS": "Goldman Sachs", "MS": "Morgan Stanley", "C": "Citigroup", "WFC": "Wells Fargo",
+        "BLK": "BlackRock", "SCHW": "Charles Schwab", "AXP": "American Express", "SPY": "S&P 500 ETF",
+        "QQQ": "Nasdaq 100 ETF", "IWM": "Russell 2000 ETF", "GLD": "Gold Trust", "SLV": "Silver Trust",
+        "USO": "United States Oil", "UNG": "Natural Gas Fund", "TLT": "20+ Yr Treasury", "HYG": "High Yield Bond",
+        "EEM": "Emerging Markets", "FXI": "China Large-Cap", "BABA": "Alibaba Group", "JD": "JD.com",
+        "BIDU": "Baidu Inc.", "TCEHY": "Tencent Holdings", "TSM": "Taiwan Semi", "ASML": "ASML Holding",
+        "SBUX": "Starbucks", "TGT": "Target Corp", "LOW": "Lowe's Cos.", "TJX": "TJX Companies",
+        "LMT": "Lockheed Martin", "RTX": "Raytheon Tech", "NOC": "Northrop Grumman", "GD": "General Dynamics",
+        "DE": "Deere & Co.", "UPS": "United Parcel Svc", "FDX": "FedEx Corp", "NEE": "NextEra Energy",
+        "DUK": "Duke Energy", "SO": "Southern Co.", "AMT": "American Tower", "PLD": "Prologis Inc."
+    }
+    STOCK_POOL = list(STOCK_MAP.keys())
+
     NEWS_URL = "https://feeds.finance.yahoo.com/rss/2.0/headline?s=^GSPC&region=US&lang=en-US"
-    MOVERS_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    MOVERS_TICKER_COUNT = 50
+    HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+    
+    BROKERS = {
+        "Robinhood": "https://robinhood.com/",
+        "Fidelity": "https://www.fidelity.com/trading/overview",
+        "E*TRADE": "https://us.etrade.com/home",
+        "Charles Schwab": "https://www.schwab.com/trading",
+        "Interactive Brokers": "https://www.interactivebrokers.com/",
+        "Webull": "https://www.webull.com/"
+    }
 
 class ConfigManager:
-    """Handles reading and writing the application's configuration file."""
     def __init__(self):
         self.config = configparser.ConfigParser()
         if not os.path.exists(Config.CONFIG_FILE):
             self._create_default_config()
         else:
             self.config.read(Config.CONFIG_FILE)
+            self._repair_config() # FIX: Repair old config files
 
     def _create_default_config(self):
         self.config['LICENSE'] = {'activated': 'false'}
+        self.config['USER'] = {'default_broker': ''}
         self.save()
+
+    def _repair_config(self):
+        # Self-healing: If keys are missing from old versions, add them
+        changed = False
+        if 'USER' not in self.config:
+            self.config['USER'] = {'default_broker': ''}
+            changed = True
+        if 'LICENSE' not in self.config:
+            self.config['LICENSE'] = {'activated': 'false'}
+            changed = True
+        if changed: self.save()
 
     def is_activated(self): return self.config.getboolean('LICENSE', 'activated', fallback=False)
     def set_activated(self): self.config.set('LICENSE', 'activated', 'true'); self.save()
     
+    def get_broker(self): return self.config.get('USER', 'default_broker', fallback='')
+    def set_broker(self, url): self.config.set('USER', 'default_broker', url); self.save()
+    def clear_broker(self): self.config.set('USER', 'default_broker', ''); self.save()
+
     def save(self):
         with open(Config.CONFIG_FILE, 'w') as configfile:
             self.config.write(configfile)
@@ -73,67 +175,143 @@ class ConfigManager:
 # =================================================================================================
 # SERVICES (DATA & LOGIC LAYER)
 # =================================================================================================
+class AIService:
+    def __init__(self):
+        self.client = None
+        self.init_error = None
+        self.token = Config.get_ai_token()
+        
+        if not AI_LIB_AVAILABLE:
+            self.init_error = f"OpenAI Library missing. Error: {AI_IMPORT_ERROR}"
+            return
+
+        if not self.token:
+            self.init_error = "Decryption failed or Token empty."
+            return
+
+        try:
+            self.client = OpenAI(
+                api_key=self.token,
+                base_url="https://models.inference.ai.azure.com"
+            )
+            logging.info("AI Service: Connected via GitHub Models Endpoint.")
+        except Exception as e:
+            self.init_error = f"Client Init Failed: {str(e)}"
+            logging.error(f"Failed to init AI Client: {e}")
+
+    def generate_insight(self, ticker, context_data):
+        if self.init_error or not self.client:
+            return "AI Service Unavailable. Check configuration."
+        
+        system_prompt = f"""You are Artemis, a senior institutional trading analyst.
+        Analyze the provided stock data deeply.
+        
+        DATA PROVIDED for {ticker}:
+        {context_data}
+
+        INSTRUCTIONS:
+        1. Start with a clear "Analyst Summary" (Bullish/Bearish/Neutral).
+        2. Analyze Technical Structure based on the indicators provided.
+        3. Evaluate the Prediction Models (Compare Trend, SVM, and LSTM).
+        4. Define Key Support & Resistance levels based on the data.
+        5. Conclude with a clear actionable idea and risk assessment.
+        
+        Format: Use clear headings and bullet points. Keep it professional and dense with insights.
+        """
+
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4o", 
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": "Generate full strategic report."}
+                ],
+                temperature=0.4
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            return f"AI Analysis Failed: {e}"
+
+    def ask_bot(self, user_query, context=""):
+        if self.init_error: return "System Error: AI Unavailable."
+        system_prompt = f"You are Artemis, a financial AI assistant. Context: {context}. Be concise. End with 'Not financial advice.'"
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4o", messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_query}
+                ], temperature=0.5
+            )
+            return response.choices[0].message.content
+        except Exception as e: return f"Error: {str(e)}"
+
 class DataService:
     def fetch_market_data_async(self, queue):
         def worker():
             try:
-                logging.info("Fetching market data...")
+                logging.info("Starting background loading...")
                 results = {}
-                queue.put(("loading_status", "Fetching market indices..."))
-                results['indices'] = self._fetch_indices()
-                queue.put(("loading_status", "Fetching S&P 500 heatmap data..."))
-                results['heatmap_data'] = self._fetch_heatmap_data()
-                queue.put(("loading_status", "Fetching top market movers..."))
-                results['movers'] = self._fetch_movers()
-                queue.put(("loading_status", "Fetching financial news..."))
-                results['news'] = self._fetch_news()
-                logging.info("All market data fetched.")
+                queue.put(("loading_status", "Initializing Global Market Data..."))
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                    future_stocks = executor.submit(self._fetch_stock_pool)
+                    future_news = executor.submit(self._fetch_news)
+                    
+                    global PredictionEngineClass
+                    if PredictionEngineClass is None:
+                        queue.put(("loading_status", "Initializing Deep Learning Core..."))
+                        try:
+                            import prediction_engine
+                            PredictionEngineClass = prediction_engine.PredictionEngine
+                            logging.info("AI Engine loaded successfully.")
+                        except Exception as e:
+                            logging.error(f"Error initializing AI engine: {e}")
+
+                    results['stocks'] = future_stocks.result()
+                    results['news'] = future_news.result()
+
+                logging.info("All parallel tasks finished.")
                 queue.put(("loading_done", results))
             except Exception as e:
                 logging.error(f"Error in market data fetch worker: {e}", exc_info=True)
                 queue.put(("loading_error", e))
-        threading.Thread(target=worker, daemon=True, name="MarketDataThread").start()
+        threading.Thread(target=worker, daemon=True, name="StartupThread").start()
 
-    def _fetch_indices(self):
+    def _fetch_single_stock(self, ticker):
+        try:
+            stock = yf.Ticker(ticker)
+            info = stock.fast_info
+            price = info['last_price']
+            change = price - info['previous_close']
+            pct = (change / info['previous_close']) * 100
+            return {
+                'ticker': ticker, 'price': price, 'change': change, 'pct': pct,
+                'volume': info.get('last_volume', 0)
+            }
+        except Exception: return None
+
+    def _fetch_stock_pool(self):
+        display_pool = Config.STOCK_POOL[:12]
         data = []
-        for name, ticker in Config.INDICES.items():
-            try:
-                hist = yf.Ticker(ticker).history(period="2d")
-                if len(hist) >= 2:
-                    price, prev_close = hist['Close'].iloc[-1], hist['Close'].iloc[-2]
-                    data.append({'name': name, 'price': price, 'change': price - prev_close, 'pct': (price - prev_close) / prev_close * 100})
-            except Exception as e: logging.warning(f"Could not fetch index {ticker}: {e}")
-        return data
-
-    def _fetch_heatmap_data(self):
-        try:
-            # Using a smaller, representative list for performance
-            tickers = ['AAPL', 'MSFT', 'GOOG', 'AMZN', 'NVDA', 'TSLA', 'META', 'BRK-B', 'JPM', 'JNJ', 'V', 'PG', 'UNH', 'HD']
-            data = yf.download(tickers, period="2d", progress=False, threads=True)
-            if isinstance(data.columns, pd.MultiIndex):
-                pct_change = data['Close'].pct_change().iloc[-1] * 100
-                return pct_change.dropna().to_dict()
-        except Exception as e:
-            logging.warning(f"Could not fetch heatmap data: {e}")
-        return {}
-
-    def _fetch_movers(self):
-        try:
-            table = pd.read_html(Config.MOVERS_URL)[0]
-            tickers = [t.replace('.', '-') for t in table['Symbol'].tolist()[:Config.MOVERS_TICKER_COUNT]]
-            data = yf.download(tickers, period="2d", progress=False, threads=True)
-            if isinstance(data.columns, pd.MultiIndex):
-                pct_change = data['Close'].pct_change().iloc[-1] * 100
-                return {'gainers': pct_change.nlargest(5).dropna(), 'losers': pct_change.nsmallest(5).dropna()}
-        except Exception as e: logging.warning(f"Could not fetch market movers: {e}")
-        return None
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(self._fetch_single_stock, ticker) for ticker in display_pool]
+            for f in concurrent.futures.as_completed(futures):
+                if f.result(): data.append(f.result())
+        return sorted(data, key=lambda x: x['ticker'])
 
     def _fetch_news(self):
         try:
-            resp = requests.get(Config.NEWS_URL, timeout=10)
+            resp = requests.get(Config.NEWS_URL, headers=Config.HEADERS, timeout=10)
+            resp.raise_for_status()
             root = ElementTree.fromstring(resp.content)
-            return [item.find("title").text for item in root.findall(".//item")[:15]]
-        except Exception as e: logging.warning(f"Could not fetch news: {e}")
+            news_items = []
+            for item in root.findall(".//item")[:15]: 
+                pubDate = item.find("pubDate").text if item.find("pubDate") is not None else ""
+                if len(pubDate) > 16: pubDate = pubDate[:16]
+                news_items.append({'title': item.find("title").text, 'link': item.find("link").text, 'date': pubDate})
+            return news_items
+        except Exception as e: 
+            logging.warning(f"Could not fetch news: {e}")
         return None
 
     def fetch_stock_data_async(self, ticker, callback):
@@ -153,231 +331,349 @@ class DataService:
         return {'df': df, 'info': stock.info}
 
 class AnalysisService:
+    def __init__(self):
+        self.engine = None
+
     def run_full_analysis_async(self, ticker, df, queue):
         def worker():
             try:
-                queue.put(("analysis", ticker, "status", "Running technical analysis..."))
-                ta_results = self._run_ta(df.copy())
+                queue.put(("analysis", ticker, "status", "Calculating Advanced Indicators..."))
+                ta_results = self._run_pro_ta(df.copy())
                 queue.put(("analysis", ticker, "data", "ta", ta_results))
-                queue.put(("analysis", ticker, "status", "Running prediction models..."))
+                
+                queue.put(("analysis", ticker, "status", "Running Artemis Prediction Model..."))
                 pred_results = self._run_predictions(df.copy(), ticker, queue)
                 queue.put(("analysis", ticker, "data", "pred", pred_results))
-                queue.put(("analysis", ticker, "status", "Generating insights..."))
-                summary = self._generate_summary(ta_results)
-                queue.put(("analysis", ticker, "data", "summary", summary))
+                
                 queue.put(("analysis", ticker, "done", None))
             except Exception as e:
                 logging.error(f"[{ticker}] Analysis failed: {e}", exc_info=True)
                 queue.put(("analysis", ticker, "error", e))
         threading.Thread(target=worker, daemon=True, name=f"Analysis-{ticker}").start()
     
-    def _run_ta(self, df):
-        df.ta.rsi(append=True); df.ta.macd(append=True); df.ta.bbands(append=True)
-        return {'RSI': df['RSI_14'].iloc[-1], 'MACD': df['MACD_12_26_9'].iloc[-1], 
-                'Signal': df['MACDs_12_26_9'].iloc[-1], 'BBU': df.get('BBU_20_2.0', pd.Series(np.nan)).iloc[-1], 
-                'BBL': df.get('BBL_20_2.0', pd.Series(np.nan)).iloc[-1], 'df': df}
+    def _run_pro_ta(self, df):
+        df.ta.sma(length=50, append=True)
+        df.ta.sma(length=200, append=True)
+        df.ta.ema(length=12, append=True)
+        df.ta.rsi(length=14, append=True)
+        df.ta.macd(fast=12, slow=26, signal=9, append=True)
+        df.ta.stoch(append=True)
+        df.ta.adx(length=14, append=True)
+        df.ta.atr(length=14, append=True)
+        df.ta.cci(length=20, append=True)
+        df.ta.bbands(length=20, std=2, append=True)
+
+        last = df.iloc[-1]
+        return {
+            'df': df,
+            'RSI': last.get('RSI_14', 0),
+            'MACD': last.get('MACD_12_26_9', 0),
+            'MACD_Sig': last.get('MACDs_12_26_9', 0),
+            'SMA_50': last.get('SMA_50', 0),
+            'SMA_200': last.get('SMA_200', 0),
+            'ADX': last.get('ADX_14', 0),
+            'ATR': last.get('ATRr_14', 0),
+            'CCI': last.get('CCI_20_0.015', 0),
+            'STOCH_K': last.get('STOCHk_14_3_3', 0),
+            'BB_UP': last.get('BBU_20_2.0', 0),
+            'BB_LOW': last.get('BBL_20_2.0', 0),
+            'Close': last.get('Close', 0)
+        }
 
     def _run_predictions(self, df, ticker, queue):
-        predictions = {}; close = df['Close']
-        if len(close) < 20: return predictions
-        queue.put(("analysis", ticker, "status", "Predicting: Linear Regression..."))
-        X = np.arange(len(close)).reshape(-1, 1)
-        predictions['Linear Regression'] = LinearRegression().fit(X, close).predict(np.array([[len(X)]]))[0]
-        return predictions
-
-    def _generate_summary(self, ta):
-        summary = ""
-        if pd.notna(ta.get('RSI')):
-            if ta['RSI'] > 70: summary += "• Overbought Signal: RSI > 70 suggests a potential pullback.\n\n"
-            elif ta['RSI'] < 30: summary += "• Oversold Signal: RSI < 30 indicates a potential rebound.\n\n"
-        if pd.notna(ta.get('MACD')) and pd.notna(ta.get('Signal')):
-            if ta['MACD'] > ta['Signal']: summary += "• Bullish Momentum: MACD is above its signal line.\n\n"
-            else: summary += "• Bearish Momentum: MACD is below its signal line.\n\n"
-        summary += "DISCLAIMER: This is not financial advice."
-        return summary
+        if self.engine is None:
+            if PredictionEngineClass: self.engine = PredictionEngineClass()
+            else: return {"Error": "AI Engine not loaded"}
+        return self.engine.get_predictions(df)
 
 # =================================================================================================
-# ANIMATION & EFFECTS
+# ANIMATION
 # =================================================================================================
 class BackgroundAnimation:
     def __init__(self, master_canvas):
-        self.canvas = master_canvas
-        self.particles = []
-        self.mouse_trail = []
+        self.canvas = master_canvas; self.particles = []; self.mouse_trail = []
         self.canvas.bind("<Motion>", self.update_mouse_pos)
         self.after_id = self.canvas.after(100, self.setup)
 
     def setup(self):
         if not self.canvas.winfo_exists(): return
-        self._create_particles(30)
+        self._create_particles(40)
         self.update()
 
     def _create_particles(self, num):
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
+        width = self.canvas.winfo_width(); height = self.canvas.winfo_height()
         for _ in range(num):
             self.particles.append({
                 'x': random.uniform(0, width), 'y': random.uniform(0, height),
                 'vx': random.uniform(-0.3, 0.3), 'vy': random.uniform(-0.3, 0.3),
-                'radius': random.uniform(1, 3), 'alpha': random.uniform(0.1, 0.5)
+                'radius': random.uniform(1, 3)
             })
 
     def update_mouse_pos(self, event):
-        self.mouse_trail.append({'x': event.x, 'y': event.y, 'radius': 20, 'alpha': 1.0})
+        self.mouse_trail.append({'x': event.x, 'y': event.y, 'radius': 20})
 
     def update(self):
         if not self.canvas.winfo_exists(): return
         self.canvas.delete("all")
         width = self.canvas.winfo_width(); height = self.canvas.winfo_height()
-        
-        # Draw connecting lines between particles
         for i in range(len(self.particles)):
             for j in range(i + 1, len(self.particles)):
-                p1 = self.particles[i]
-                p2 = self.particles[j]
+                p1 = self.particles[i]; p2 = self.particles[j]
                 dist_sq = (p1['x'] - p2['x'])**2 + (p1['y'] - p2['y'])**2
-                if dist_sq < 150**2:
-                    alpha = 1 - (dist_sq / 150**2)
-                    color_val = int(alpha * 50) + 20
-                    color = f'#{color_val:02x}{color_val:02x}{color_val+10:02x}'
-                    self.canvas.create_line(p1['x'], p1['y'], p2['x'], p2['y'], fill=color, width=0.5)
-        
+                if dist_sq < 150**2: self.canvas.create_line(p1['x'], p1['y'], p2['x'], p2['y'], fill="#2D3748", width=0.5)
         for p in self.particles:
             p['x'] += p['vx']; p['y'] += p['vy']
             if p['x'] < 0 or p['x'] > width: p['vx'] *= -1
             if p['y'] < 0 or p['y'] > height: p['vy'] *= -1
-            color_val = int(p['alpha'] * 100) + 50; color = f'#{color_val:02x}{color_val:02x}{color_val+20:02x}'
-            self.canvas.create_oval(p['x']-p['radius'], p['y']-p['radius'], p['x']+p['radius'], p['y']+p['radius'], fill=color, outline="")
-
+            self.canvas.create_oval(p['x']-p['radius'], p['y']-p['radius'], p['x']+p['radius'], p['y']+p['radius'], fill="#4A5568", outline="")
         remaining_trail = []
         for trail_part in self.mouse_trail:
-            trail_part['radius'] *= 0.85; trail_part['alpha'] *= 0.85
+            trail_part['radius'] *= 0.85
             if trail_part['radius'] > 0.5:
                 remaining_trail.append(trail_part)
-                alpha_hex = int(trail_part['alpha'] * 100); color = f'#60a5fa{alpha_hex:02x}' # Light blue with alpha
-                self.canvas.create_oval(trail_part['x']-trail_part['radius'], trail_part['y']-trail_part['radius'],
-                                        trail_part['x']+trail_part['radius'], trail_part['y']+trail_part['radius'],
-                                        fill=color, outline="")
+                self.canvas.create_oval(trail_part['x']-trail_part['radius'], trail_part['y']-trail_part['radius'], trail_part['x']+trail_part['radius'], trail_part['y']+trail_part['radius'], fill="#60a5fa", outline="")
         self.mouse_trail = remaining_trail
-        self.after_id = self.canvas.after(33, self.update) # ~30 FPS
-
+        self.after_id = self.canvas.after(33, self.update)
     def stop(self):
         if self.after_id: self.canvas.after_cancel(self.after_id)
 
 # =================================================================================================
-# VIEWS (UI LAYER)
+# VIEWS
 # =================================================================================================
 class BaseWindow(ctk.CTkToplevel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        try: self.after(250, lambda: self.iconbitmap('icon.ico'))
-        except tk.TclError: logging.warning("icon.ico not found. Skipping icon setting.")
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(250, self.safe_load_icon); self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(100, self.lift)
+    def safe_load_icon(self):
+        try: self.iconbitmap('icon.ico')
+        except Exception: pass
     def _on_close(self): self.destroy()
-
-class ActivationView(BaseWindow):
-    def __init__(self, master, controller):
-        super().__init__(master)
-        self.title("Product Activation"); self.geometry("400x200")
-        self.controller = controller
-        self.grid_columnconfigure(0, weight=1); self.grid_rowconfigure(2, weight=1)
-        ctk.CTkLabel(self, text="Enter Product Key", font=("Segoe UI", 20, "bold")).grid(row=0, column=0, pady=(20, 10))
-        self.key_entry = ctk.CTkEntry(self, width=250, font=("Segoe UI", 14))
-        self.key_entry.grid(row=1, column=0, pady=10, padx=30)
-        self.key_entry.bind("<Return>", lambda e: self.controller.validate_key(self.key_entry.get()))
-        ctk.CTkButton(self, text="Activate", command=lambda: self.controller.validate_key(self.key_entry.get())).grid(row=2, column=0, pady=20)
-        self.transient(master); self.grab_set()
 
 class LoadingView(BaseWindow):
     def __init__(self, master):
-        super().__init__(master)
-        self.title("Loading..."); self.geometry("450x150"); self.resizable(False, False)
+        super().__init__(master); self.title("Loading..."); self.geometry("450x150"); self.resizable(False, False)
         self.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(self, text="Initializing Artemis Engine...", font=("Segoe UI", 18, "bold")).grid(row=0, column=0, pady=20)
         self.progress_bar = ctk.CTkProgressBar(self, width=350); self.progress_bar.grid(row=1, column=0, pady=5); self.progress_bar.set(0)
         self.status_label = ctk.CTkLabel(self, text="Loading...", font=("Segoe UI", 12)); self.status_label.grid(row=2, column=0, pady=10)
         self.transient(master); self.grab_set()
-    def update_progress(self, value, text):
-        self.progress_bar.set(value); self.status_label.configure(text=text)
+    def update_progress(self, value, text): self.progress_bar.set(value); self.status_label.configure(text=text)
 
-class BrokerageDialog(ctk.CTkToplevel):
-    def __init__(self, master, action, ticker, price):
-        super().__init__(master)
-        self.title(f"{action.capitalize()} Order for {ticker}"); self.geometry("350x250")
-        ctk.CTkLabel(self, text=f"Simulate {action} order for {ticker}", font=("Segoe UI", 16, "bold")).pack(pady=10)
-        ctk.CTkLabel(self, text=f"Current Price: ${price:.2f}").pack()
-        ctk.CTkLabel(self, text="Shares:").pack(pady=(10,0))
-        self.shares_entry = ctk.CTkEntry(self); self.shares_entry.pack()
-        ctk.CTkButton(self, text=f"Place {action.capitalize()} Order", command=self._confirm).pack(pady=20)
-        self.transient(master); self.grab_set()
+class BrokerageSelector(ctk.CTkToplevel):
+    def __init__(self, master, action, ticker, config_manager):
+        super().__init__(master); self.title(f"{action.capitalize()} {ticker}"); self.geometry("400x550"); self.resizable(False, False)
+        self.transient(master); self.lift(); self.focus_force(); self.grab_set()
+        self.config_manager = config_manager
+        
+        ctk.CTkLabel(self, text=f"Select a Broker to {action.capitalize()}", font=("Segoe UI", 18, "bold")).pack(pady=15)
+        
+        self.remember_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(self, text="Remember my choice", variable=self.remember_var).pack(pady=(0, 10))
 
-    def _confirm(self):
-        try:
-            shares = int(self.shares_entry.get())
-            if shares > 0:
-                logging.info(f"SIMULATED ORDER: {self.title()} for {shares} shares.")
-                messagebox.showinfo("Order Placed", f"Simulated order to {self.title()} for {shares} shares has been logged.", parent=self)
-                self.destroy()
-            else: raise ValueError
-        except (ValueError, TypeError):
-            messagebox.showerror("Invalid Input", "Please enter a valid number of shares.", parent=self)
-            
+        scroll = ctk.CTkScrollableFrame(self, width=350, height=400); scroll.pack(pady=10, padx=10, fill="both", expand=True)
+        for name, url in Config.BROKERS.items():
+            ctk.CTkButton(scroll, text=f"Open {name}", height=40, fg_color="#1f2937", hover_color="#374151", anchor="w", font=("Segoe UI", 14), 
+                         command=lambda u=url: self.open_broker(u)).pack(pady=5, padx=5, fill="x")
+    
+    def open_broker(self, url):
+        if self.remember_var.get():
+            self.config_manager.set_broker(url)
+        webbrowser.open(url)
+        self.destroy()
+
+class HelpWindow(BaseWindow):
+    def __init__(self, master):
+        super().__init__(master); self.title("Help & Stock List"); self.geometry("600x600")
+        self.lift(); self.focus_force()
+        ctk.CTkLabel(self, text="Supported Tickers", font=("Segoe UI", 16, "bold")).pack(pady=10)
+        
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=20)
+        ctk.CTkLabel(header, text="Ticker", font=("Segoe UI", 12, "bold"), width=80, anchor="w").pack(side="left")
+        ctk.CTkLabel(header, text="Company Name", font=("Segoe UI", 12, "bold"), anchor="w").pack(side="left", padx=10)
+
+        scroll = ctk.CTkScrollableFrame(self, width=550, height=500)
+        scroll.pack(pady=10, padx=10, fill="both", expand=True)
+        
+        for ticker in Config.STOCK_POOL:
+            row = ctk.CTkFrame(scroll, fg_color="transparent")
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(row, text=ticker, font=("Consolas", 12, "bold"), width=80, anchor="w", text_color="#60a5fa").pack(side="left")
+            name = Config.STOCK_MAP.get(ticker, "Unknown")
+            ctk.CTkLabel(row, text=name, font=("Segoe UI", 12), anchor="w").pack(side="left", padx=10)
+
+class ChatWindow(BaseWindow):
+    def __init__(self, master, ai_service, context=""):
+        super().__init__(master); self.title("Artemis AI Assistant"); self.geometry("500x600")
+        self.lift(); self.focus_force()
+        self.ai_service = ai_service; self.context = context
+        self.grid_columnconfigure(0, weight=1); self.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(self, text="Artemis AI Assistant", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, pady=10)
+        self.chat_area = ctk.CTkTextbox(self, font=("Segoe UI", 12), state="disabled"); self.chat_area.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
+        input_frame = ctk.CTkFrame(self, fg_color="transparent"); input_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
+        self.input_field = ctk.CTkEntry(input_frame, placeholder_text="Ask about this stock...", width=350); self.input_field.pack(side="left", padx=(0, 5))
+        self.input_field.bind("<Return>", self.send_message)
+        self.send_btn = ctk.CTkButton(input_frame, text="Send", width=80, command=self.send_message); self.send_btn.pack(side="right")
+        self.append_message("System", "I have loaded the current market data for this stock. How can I help?")
+
+    def send_message(self, event=None):
+        msg = self.input_field.get().strip()
+        if not msg: return
+        self.append_message("You", msg); self.input_field.delete(0, "end")
+        threading.Thread(target=self._get_response, args=(msg,)).start()
+    
+    def _get_response(self, msg):
+        response = self.ai_service.ask_bot(msg, self.context)
+        self.after(0, lambda: self.append_message("Artemis", response))
+
+    def append_message(self, sender, text):
+        self.chat_area.configure(state="normal"); self.chat_area.insert("end", f"\n[{sender}]: {text}\n"); self.chat_area.see("end"); self.chat_area.configure(state="disabled")
+
 class AnalysisView(BaseWindow):
     def __init__(self, master, controller, ticker):
-        super().__init__(master)
-        self.title(f"Analysis Engine - [{ticker}]"); self.state("zoomed")
-        self.controller = controller; self.ticker = ticker
-        self.grid_columnconfigure(1, weight=3); self.grid_columnconfigure(0, weight=1); self.grid_rowconfigure(0, weight=1)
-        self._create_left_panel(); self._create_right_panel()
+        super().__init__(master); self.title(f"Pro Terminal - [{ticker}]"); self.state("zoomed")
         self.lift(); self.focus_force()
+        self.controller = controller; self.ticker = ticker; self.ai_service = AIService()
+        
+        self.chart_style = tk.StringVar(value="candle")
+        self.draw_mode = None; self.draw_points = []
+        
+        self.grid_columnconfigure(1, weight=4); self.grid_columnconfigure(0, weight=1); self.grid_rowconfigure(0, weight=1)
+        self._create_left_panel(); self._create_right_panel()
 
     def _create_left_panel(self):
-        left_panel = ctk.CTkFrame(self, fg_color="#1D232A"); left_panel.grid(row=0, column=0, sticky="nsew", padx=(10,5), pady=10)
-        left_panel.grid_rowconfigure(5, weight=1)
+        left_panel = ctk.CTkFrame(self, fg_color="#1D232A"); left_panel.grid(row=0, column=0, sticky="nsew", padx=(10,2), pady=10)
+        left_panel.grid_rowconfigure(2, weight=1); left_panel.grid_rowconfigure(3, weight=1)
+        left_panel.grid_columnconfigure(0, weight=1)
+        
         self.header_frame = ctk.CTkFrame(left_panel, fg_color="transparent"); self.header_frame.grid(row=0, column=0, sticky="new", padx=15, pady=15, columnspan=2)
-        self.header_label = ctk.CTkLabel(self.header_frame, text=f"Analyzing {self.ticker}...", font=("Segoe UI", 24, "bold")); self.header_label.pack(side=tk.LEFT, anchor="w")
-        ctk.CTkButton(left_panel, text="Back to Dashboard", command=self._on_close).grid(row=1, column=0, sticky="w", padx=15, pady=10, columnspan=2)
-        self.ta_text = self._create_panel(left_panel, "Technical Analysis", 2)
-        self.pred_text = self._create_panel(left_panel, "Prediction Engine", 3)
-        self.summary_text = self._create_panel(left_panel, "Automated Insights", 4, is_summary=True)
+        self.header_label = ctk.CTkLabel(self.header_frame, text=f"{self.ticker}", font=("Segoe UI", 28, "bold")); self.header_label.pack(side=tk.LEFT, anchor="w")
+        
+        ctk.CTkButton(left_panel, text="< Dashboard", width=100, command=self._on_close).grid(row=1, column=0, sticky="w", padx=15, pady=(0,10))
+        ctk.CTkButton(left_panel, text="Ask Artemis AI", fg_color="#7c3aed", hover_color="#6d28d9", command=self.open_ai_chat).grid(row=1, column=1, sticky="e", padx=15, pady=(0,10))
+        
+        offline_frame = ctk.CTkFrame(left_panel)
+        offline_frame.grid(row=2, column=0, sticky='nsew', padx=15, pady=5, columnspan=2)
+        offline_frame.grid_columnconfigure(0, weight=1); offline_frame.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(offline_frame, text="Artemis Insight (Live Data)", font=("Segoe UI", 14, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=(10,5))
+        self.offline_text = ctk.CTkTextbox(offline_frame, wrap="word", font=("Consolas", 12)); self.offline_text.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
+        
+        insight_frame = ctk.CTkFrame(left_panel)
+        insight_frame.grid(row=3, column=0, sticky='nsew', padx=15, pady=5, columnspan=2)
+        insight_frame.grid_columnconfigure(0, weight=1); insight_frame.grid_rowconfigure(2, weight=1)
+        ctk.CTkLabel(insight_frame, text="Artemis AI Analysis", font=("Segoe UI", 14, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=(10,5))
+        self.gen_btn = ctk.CTkButton(insight_frame, text="Generate Analyst Insight", fg_color="#7c3aed", hover_color="#6d28d9", command=self.generate_ai_report, state="disabled")
+        self.gen_btn.grid(row=1, column=0, padx=10, pady=(0,5), sticky="ew")
+        self.insight_text = ctk.CTkTextbox(insight_frame, wrap="word", font=("Consolas", 12)); self.insight_text.grid(row=2, column=0, sticky="nsew", padx=10, pady=5)
+        
+        self.update_panel_text(self.insight_text, ">> System Standby. \n>> Click 'Generate Analyst Insight' to initialize Artemis Neural Network...")
+        
         self.trade_frame = ctk.CTkFrame(left_panel, fg_color="transparent"); self.trade_frame.grid(row=5, column=0, sticky="sew", padx=15, pady=10, columnspan=2)
-        self.trade_frame.grid_columnconfigure([0,1], weight=1)
-        self.buy_button = ctk.CTkButton(self.trade_frame, text="Buy", fg_color="#059669", hover_color="#047857", command=self.on_trade, state="disabled")
-        self.buy_button.grid(row=0, column=0, padx=5, sticky="ew")
-        self.sell_button = ctk.CTkButton(self.trade_frame, text="Sell", fg_color="#DC2626", hover_color="#B91C1C", command=self.on_trade, state="disabled")
-        self.sell_button.grid(row=0, column=1, padx=5, sticky="ew")
-        status_frame = ctk.CTkFrame(left_panel, fg_color="transparent"); status_frame.grid(row=6, column=0, sticky="sew", padx=15, pady=10, columnspan=2)
+        self.trade_frame.grid_columnconfigure([0,1,2], weight=1)
+        
+        self.buy_button = ctk.CTkButton(self.trade_frame, text="Buy", fg_color="#059669", hover_color="#047857", command=self.on_trade, state="disabled"); self.buy_button.grid(row=0, column=0, padx=5, sticky="ew")
+        self.sell_button = ctk.CTkButton(self.trade_frame, text="Sell", fg_color="#DC2626", hover_color="#B91C1C", command=self.on_trade, state="disabled"); self.sell_button.grid(row=0, column=1, padx=5, sticky="ew")
+        self.reset_btn = ctk.CTkButton(self.trade_frame, text="Reset Broker", width=80, fg_color="#4b5563", command=self.reset_broker_choice)
+        self.reset_btn.grid(row=1, column=0, columnspan=2, pady=(5,0))
+        
+        ctk.CTkLabel(left_panel, text="DISCLAIMER: NOT FINANCIAL ADVICE", font=("Segoe UI", 11, "bold"), text_color="#ef4444").grid(row=7, column=0, columnspan=2, pady=(10,5))
+        status_frame = ctk.CTkFrame(left_panel, fg_color="transparent"); status_frame.grid(row=6, column=0, sticky="sew", padx=15, pady=5, columnspan=2)
         self.status_label = ctk.CTkLabel(status_frame, text="Initializing...", font=("Segoe UI", 11)); self.status_label.pack(side=tk.LEFT)
         self.progress_bar = ctk.CTkProgressBar(status_frame, width=200); self.progress_bar.pack(side=tk.RIGHT); self.progress_bar.start()
 
-    def _create_panel(self, parent, title, row, is_summary=False):
-        frame = ctk.CTkFrame(parent); frame.grid(row=row, column=0, sticky='nsew' if is_summary else 'ew', padx=15, pady=10)
-        frame.grid_columnconfigure(0, weight=1); frame.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(frame, text=title, font=("Segoe UI", 16, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=5)
-        font = ("Segoe UI", 13) if is_summary else ("Consolas", 12)
-        textbox = ctk.CTkTextbox(frame, wrap="word" if is_summary else "none", font=font, activate_scrollbars=True)
-        textbox.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
-        textbox.insert("1.0", "Calculating..."); textbox.configure(state="disabled")
-        return textbox
-
     def _create_right_panel(self):
-        right_panel = ctk.CTkFrame(self); right_panel.grid(row=0, column=1, sticky="nsew", padx=(5,10), pady=10)
-        right_panel.grid_rowconfigure(1, weight=1); right_panel.grid_columnconfigure(0, weight=1)
-        tools_frame = ctk.CTkFrame(right_panel, fg_color="transparent"); tools_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=5)
-        ctk.CTkLabel(tools_frame, text="Chart Tools:", font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT, padx=(0,10))
-        self.show_bb = ctk.CTkCheckBox(tools_frame, text="Bollinger Bands", command=self.redraw_chart); self.show_bb.pack(side=tk.LEFT, padx=5)
-        self.show_mav = ctk.CTkCheckBox(tools_frame, text="MA (20, 50)", command=self.redraw_chart); self.show_mav.pack(side=tk.LEFT, padx=5)
-        self.show_rsi = ctk.CTkCheckBox(tools_frame, text="RSI Subplot", command=self.redraw_chart); self.show_rsi.pack(side=tk.LEFT, padx=5)
-        chart_frame = ctk.CTkFrame(right_panel); chart_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
+        right_panel = ctk.CTkFrame(self); right_panel.grid(row=0, column=1, sticky="nsew", padx=(0,10), pady=10)
+        right_panel.grid_rowconfigure(2, weight=1); right_panel.grid_columnconfigure(0, weight=1)
+        
+        controls_frame = ctk.CTkFrame(right_panel, fg_color="#2B2D42")
+        controls_frame.grid(row=0, column=0, sticky="ew", padx=1, pady=1)
+        ctk.CTkLabel(controls_frame, text="Chart Style:", font=("Segoe UI", 12)).pack(side="left", padx=10)
+        ctk.CTkSegmentedButton(controls_frame, values=["Candle", "Line", "OHLC"], command=self.change_chart_style, variable=self.chart_style).pack(side="left", padx=5)
+        
+        self.line_btn = ctk.CTkButton(controls_frame, text="Trendline", width=80, fg_color="#4b5563", command=lambda: self.toggle_draw_mode('line'))
+        self.line_btn.pack(side="right", padx=5, pady=5)
+        self.box_btn = ctk.CTkButton(controls_frame, text="Box", width=60, fg_color="#4b5563", command=lambda: self.toggle_draw_mode('box'))
+        self.box_btn.pack(side="right", padx=5, pady=5)
+        
+        toolbar_frame = ctk.CTkFrame(right_panel, fg_color="#2B2D42")
+        toolbar_frame.grid(row=1, column=0, sticky="ew", padx=1, pady=(0,1))
+        chart_frame = ctk.CTkFrame(right_panel); chart_frame.grid(row=2, column=0, sticky="nsew", padx=1, pady=(0,1))
         self.fig = Figure(figsize=(5, 4), dpi=100, facecolor="#2B2D42")
-        self.canvas_widget = FigureCanvasTkAgg(self.fig, master=chart_frame); self.canvas_widget.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.canvas_widget = FigureCanvasTkAgg(self.fig, master=chart_frame)
+        self.canvas_widget.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.canvas_widget.mpl_connect('button_press_event', self.on_canvas_click)
+        self.toolbar = NavigationToolbar2Tk(self.canvas_widget, toolbar_frame)
+        self.toolbar.update(); self.toolbar.pack(side=tk.TOP, fill=tk.X)
 
+    def toggle_draw_mode(self, mode):
+        if self.draw_mode == mode: self.draw_mode = None
+        else: self.draw_mode = mode
+        self.draw_points = []
+        
+        if self.draw_mode == 'line':
+            self.line_btn.configure(fg_color="#ef4444", text="Click Start"); self.box_btn.configure(fg_color="#4b5563", text="Box")
+        elif self.draw_mode == 'box':
+            self.box_btn.configure(fg_color="#ef4444", text="Click Start"); self.line_btn.configure(fg_color="#4b5563", text="Trendline")
+        else:
+            self.line_btn.configure(fg_color="#4b5563", text="Trendline"); self.box_btn.configure(fg_color="#4b5563", text="Box")
+
+    def on_canvas_click(self, event):
+        if self.draw_mode is None or event.inaxes is None: return
+        self.draw_points.append((event.xdata, event.ydata))
+        btn = self.line_btn if self.draw_mode == 'line' else self.box_btn
+        if len(self.draw_points) == 1: btn.configure(text="Click End")
+        elif len(self.draw_points) == 2:
+            ax = event.inaxes; p1, p2 = self.draw_points
+            if self.draw_mode == 'line': ax.add_line(Line2D([p1[0], p2[0]], [p1[1], p2[1]], color='yellow', linewidth=2))
+            elif self.draw_mode == 'box':
+                x_min = min(p1[0], p2[0]); y_min = min(p1[1], p2[1])
+                width = abs(p1[0] - p2[0]); height = abs(p1[1] - p2[1])
+                ax.add_patch(Rectangle((x_min, y_min), width, height, linewidth=2, edgecolor='cyan', facecolor='none'))
+            self.canvas_widget.draw(); self.toggle_draw_mode(self.draw_mode)
+
+    def open_ai_chat(self):
+        context = "Data Loading..."
+        if hasattr(self, 'ta_data') and hasattr(self, 'pred_data'): 
+            context = f"Stock: {self.ticker} - " + self._build_ai_context()
+        ChatWindow(self, self.ai_service, context)
+
+    def _build_ai_context(self):
+        d = self.ta_data; p = self.pred_data
+        return f"""Current Price: ${d.get('Close', 0):.2f}\nTechnical Indicators: RSI={d.get('RSI',0):.2f}, MACD={d.get('MACD',0):.2f}, ADX={d.get('ADX',0):.2f}, ATR={d.get('ATR',0):.2f}, SMA200={d.get('SMA_200',0):.2f}\nModel Forecasts: {str(p)}"""
+
+    def update_consolidated_report(self):
+        if not hasattr(self, 'ta_data') or not hasattr(self, 'pred_data'): return
+        self.gen_btn.configure(state="normal")
+        d = self.ta_data; p = self.pred_data
+        text = f"--- PRELIMINARY DATA FEED ---\n\nTECHNICAL INDICATORS\n"
+        text += f"RSI (14): {d['RSI']:.2f} | MACD: {d['MACD']:.2f}\nADX (Strength): {d['ADX']:.2f} | ATR (Vol): {d['ATR']:.2f}\n"
+        text += f"SMA 50: {d['SMA_50']:.2f} | SMA 200: {d['SMA_200']:.2f}\nStoch K: {d['STOCH_K']:.2f} | CCI: {d['CCI']:.2f}\n\n"
+        text += f"ARTEMIS MODEL FORECASTS\n"
+        for k, v in p.items():
+             val = f"${v:.2f}" if isinstance(v, (int, float)) else v
+             text += f"{k:<20}: {val}\n"
+        self.update_panel_text(self.offline_text, text)
+
+    def generate_ai_report(self):
+        self.gen_btn.configure(state="disabled", text="Generating Analysis..."); self.update_status("Contacting Artemis AI Core...")
+        def run_ai():
+            context = self._build_ai_context()
+            report = self.ai_service.generate_insight(self.ticker, context)
+            self.after(0, lambda: self.update_panel_text(self.insight_text, report))
+            self.after(0, lambda: self.gen_btn.configure(state="normal", text="Regenerate Insight"))
+            self.after(0, lambda: self.update_status("Analysis Complete."))
+        threading.Thread(target=run_ai).start()
+
+    def change_chart_style(self, style):
+        if hasattr(self, 'ta_data'): self.update_chart(self.ta_data)
+    
     def update_status(self, text): self.status_label.configure(text=text)
     def stop_progress(self): self.progress_bar.stop(); self.progress_bar.set(1.0)
+    
     def update_header(self, info):
-        self.info = info; price = info.get('regularMarketPrice', 0); change = info.get('regularMarketChange', 0); pct = info.get('regularMarketChangePercent', 0) * 100
+        price = info.get('regularMarketPrice', 0); change = info.get('regularMarketChange', 0); pct = info.get('regularMarketChangePercent', 0) * 100
         color = "green" if change >= 0 else "red"
-        self.header_label.configure(text=f"{info.get('shortName', self.ticker)}")
         ctk.CTkLabel(self.header_frame, text=f"${price:.2f}", font=("Segoe UI", 22)).pack(side=tk.LEFT, padx=10)
         ctk.CTkLabel(self.header_frame, text=f"{change:+.2f} ({pct:+.2f}%)", text_color=color, font=("Segoe UI", 12)).pack(side=tk.LEFT)
         self.buy_button.configure(state="normal"); self.sell_button.configure(state="normal")
@@ -385,36 +681,41 @@ class AnalysisView(BaseWindow):
     def update_panel_text(self, widget, content):
         widget.configure(state="normal"); widget.delete("1.0", tk.END); widget.insert("1.0", content); widget.configure(state="disabled")
 
-    def redraw_chart(self):
-        if hasattr(self, 'ta_data'): self.update_chart(self.ta_data)
-
     def update_chart(self, ta_data):
+        # FIX: Disable built-in volume to prevent Tkinter freeze, use addplot instead
         self.fig.clear(); df = ta_data['df']
-        num_subplots = 2 if self.show_rsi.get() else 1
-        ax1 = self.fig.add_subplot(num_subplots, 1, 1); axes = [ax1]
-        if num_subplots > 1: axes.append(self.fig.add_subplot(num_subplots, 1, 2, sharex=ax1))
+        ax1 = self.fig.add_subplot(111)
         mc = mpf.make_marketcolors(up='#26a69a', down='#ef5350', inherit=True)
         s = mpf.make_mpf_style(marketcolors=mc, base_mpf_style='nightclouds', facecolor="#2B2D42", gridstyle="-")
         addplots = []
-        if self.show_bb.get() and 'BBU_20_2.0' in df and df['BBU_20_2.0'].notna().any():
-            addplots.extend([mpf.make_addplot(df['BBU_20_2.0'], color='#00aaff'), mpf.make_addplot(df['BBL_20_2.0'], color='#00aaff')])
-        if self.show_rsi.get() and 'RSI_14' in df:
-            addplots.append(mpf.make_addplot(df['RSI_14'], panel=1, color='orange', ylabel='RSI'))
-        mav = (20, 50) if self.show_mav.get() else ()
+        if 'BBU_20_2.0' in df and df['BBU_20_2.0'].notna().any():
+            addplots.extend([mpf.make_addplot(df['BBU_20_2.0'], ax=ax1, color='#00aaff', width=0.8, alpha=0.3), mpf.make_addplot(df['BBL_20_2.0'], ax=ax1, color='#00aaff', width=0.8, alpha=0.3)])
+        if 'SMA_50' in df: addplots.append(mpf.make_addplot(df['SMA_50'], ax=ax1, color='orange', width=1.0))
+        if 'SMA_200' in df: addplots.append(mpf.make_addplot(df['SMA_200'], ax=ax1, color='white', width=1.5))
         
-        volume_ax = axes[0] if not self.show_rsi.get() else axes[1]
-        mpf.plot(df, type='candle', style=s, ax=axes[0], addplot=addplots, volume=volume_ax if not self.show_rsi.get() else False, mav=mav, panel_ratios=(3,1) if self.show_rsi.get() else (1,0))
-
-        if self.show_rsi.get():
-             axes[1].axhline(70, color='r', linestyle='--', linewidth=0.5); axes[1].axhline(30, color='g', linestyle='--', linewidth=0.5)
+        chart_type = self.chart_style.get().lower()
+        if chart_type not in ['candle', 'line', 'ohlc']: chart_type = 'candle'
+        
+        # Safe Volume Fix: Don't use volume=True with external axes. 
+        # If you really want volume, it needs a separate GridSpec, but for now we ensure stability.
+        mpf.plot(df, type=chart_type, style=s, ax=ax1, addplot=addplots, volume=False)
+        ax1.tick_params(axis='x', rotation=0)
         self.fig.tight_layout(); self.canvas_widget.draw()
 
     def on_trade(self):
-        widget = self.focus_get(); action = "buy" if "buy" in str(widget) else "sell"
-        BrokerageDialog(self, action, self.ticker, self.info.get('regularMarketPrice', 0))
+        saved_broker = self.controller.config_manager.get_broker()
+        if saved_broker:
+            webbrowser.open(saved_broker)
+        else:
+            widget = self.focus_get(); action = "buy" if "buy" in str(widget) else "sell"
+            BrokerageSelector(self, action, self.ticker, self.controller.config_manager)
+    
+    def reset_broker_choice(self):
+        self.controller.config_manager.clear_broker()
+        messagebox.showinfo("Reset", "Broker choice cleared.")
 
 # =================================================================================================
-# APP CONTROLLER (MAIN APPLICATION)
+# APP CONTROLLER
 # =================================================================================================
 class App(ctk.CTk):
     def __init__(self, *args, **kwargs):
@@ -424,143 +725,123 @@ class App(ctk.CTk):
         self.data_service = DataService(); self.analysis_service = AnalysisService()
         self.ui_queue = Queue(); self.after(100, self.process_ui_queue)
         self.analysis_windows = {}
-        
-        self.withdraw()
-        if self.config_manager.is_activated(): self.show_loading_screen()
-        else: self.activation_view = ActivationView(self, self)
-
-    def validate_key(self, key):
-        if key == Config.VALID_KEY:
-            self.config_manager.set_activated(); self.activation_view.destroy(); self.show_loading_screen()
-        else: messagebox.showerror("Error", "Invalid Product Key", parent=self.activation_view)
+        self.full_stock_list = []; self.rotation_index = 0
+        self.withdraw(); self.show_loading_screen()
 
     def show_loading_screen(self):
         self.loading_view = LoadingView(self)
         self.data_service.fetch_market_data_async(self.ui_queue)
 
     def on_market_data_loaded(self, success, data):
-        if success:
+        if success: 
+            self.full_stock_list = data.get('stocks', [])
             self.loading_view.update_progress(1.0, "Ready."); self.after(500, lambda: self.show_dashboard(data))
         else: messagebox.showerror("Error", f"Failed to load market data:\n{data}"); self.destroy()
 
     def show_dashboard(self, market_data):
         self.loading_view.destroy(); self.state("zoomed"); self.deiconify()
         self.grid_columnconfigure(0, weight=1); self.grid_rowconfigure(1, weight=1)
-        
-        self.bg_canvas = tk.Canvas(self, bg="#111827", highlightthickness=0)
-        self.bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        self.bg_canvas = tk.Canvas(self, bg="#111827", highlightthickness=0); self.bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
         self.animation = BackgroundAnimation(self.bg_canvas)
 
         header_frame = ctk.CTkFrame(self, fg_color="transparent"); header_frame.grid(row=0, column=0, padx=20, pady=20, sticky="ew")
         header_frame.grid_columnconfigure(1, weight=1)
+        
         ctk.CTkLabel(header_frame, text=Config.APP_NAME, font=("Segoe UI", 32, "bold")).grid(row=0, column=0, sticky="w")
-        ctk.CTkButton(header_frame, text="License", command=self.show_license_info).grid(row=0, column=1, sticky="w", padx=20)
+        
         search_frame = ctk.CTkFrame(header_frame, fg_color="transparent"); search_frame.grid(row=0, column=2, sticky="e")
-        self.ticker_entry = ctk.CTkEntry(search_frame, placeholder_text="Enter Ticker...", width=200)
-        self.ticker_entry.grid(row=0, column=0, padx=(0, 10)); self.ticker_entry.bind("<Return>", lambda e: self.launch_analysis())
-        ctk.CTkButton(search_frame, text="Analyze", command=self.launch_analysis).grid(row=0, column=1)
+        
+        self.google_entry = ctk.CTkEntry(search_frame, placeholder_text="Google Search...", width=200)
+        self.google_entry.pack(side="left", padx=5)
+        self.google_entry.bind("<Return>", lambda e: webbrowser.open(f"https://www.google.com/search?q={self.google_entry.get()}"))
+        
+        ctk.CTkButton(search_frame, text="?", width=40, command=lambda: HelpWindow(self)).pack(side="left", padx=5)
+        
+        self.ticker_entry = ctk.CTkEntry(search_frame, placeholder_text="Enter Ticker...", width=150)
+        self.ticker_entry.pack(side="left", padx=5)
+        self.ticker_entry.bind("<Return>", lambda e: self.launch_analysis())
+        ctk.CTkButton(search_frame, text="Analyze", width=80, command=self.launch_analysis).pack(side="left", padx=5)
 
         main_content = ctk.CTkFrame(self, fg_color="transparent"); main_content.grid(row=1, column=0, padx=20, pady=0, sticky="nsew")
-        main_content.grid_columnconfigure([0, 1, 2], weight=3); main_content.grid_columnconfigure(3, weight=2)
-        main_content.grid_rowconfigure(1, weight=1)
-        indices_frame = ctk.CTkFrame(main_content, fg_color="transparent"); indices_frame.grid(row=0, column=0, columnspan=4, pady=(0, 20), sticky="ew")
-        
-        self._update_indices_display(indices_frame, market_data.get('indices', []))
-        self._create_watchlist_panel(main_content)
-        self._create_sentiment_panel(main_content, market_data.get('sentiment', 50))
-        self._update_movers_display(main_content, market_data.get('movers'))
-        self._update_news_display(main_content, market_data.get('news'))
+        main_content.grid_columnconfigure(0, weight=1)
+        main_content.grid_rowconfigure(5, weight=1) 
 
-    def _update_indices_display(self, parent, indices_data):
-        for i, data in enumerate(indices_data):
-            parent.grid_columnconfigure(i, weight=1)
-            card = ctk.CTkFrame(parent); card.grid(row=0, column=i, padx=10, sticky="ew")
-            ctk.CTkLabel(card, text=data['name'], font=("Segoe UI", 16, "bold")).pack(pady=(10, 0))
-            ctk.CTkLabel(card, text=f"${data['price']:.2f}", font=("Segoe UI", 22)).pack()
-            color = "green" if data['change'] >= 0 else "red"
-            ctk.CTkLabel(card, text=f"{data['change']:+.2f} ({data['pct']:.2f}%)", text_color=color, font=("Segoe UI", 12)).pack(pady=(0, 10))
+        ctk.CTkLabel(main_content, text="Global Market Indices", font=("Segoe UI", 20, "bold"), anchor="w").grid(row=0, column=0, sticky="w", pady=(0, 10))
+        self.indices_frame = ctk.CTkFrame(main_content, fg_color="transparent"); self.indices_frame.grid(row=1, column=0, sticky="ew", pady=(0, 20))
+        self.start_rotation()
 
-    def _create_sentiment_panel(self, parent, sentiment_value):
-        frame = ctk.CTkFrame(parent); frame.grid(row=1, column=1, sticky="nsew", padx=(0, 10))
-        frame.grid_columnconfigure(0, weight=1); frame.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(frame, text="Market Sentiment", font=("Segoe UI", 18, "bold")).grid(row=0, column=0, padx=15, pady=10)
-        
-        gauge_canvas = tk.Canvas(frame, bg=frame.cget("fg_color")[1], highlightthickness=0, width=200, height=120)
-        gauge_canvas.grid(row=1, column=0, pady=10)
+        ctk.CTkLabel(main_content, text="Top Market Leaders", font=("Segoe UI", 20, "bold"), anchor="w").grid(row=2, column=0, sticky="w", pady=(0, 10))
+        top_stocks_frame = ctk.CTkFrame(main_content, fg_color="transparent"); top_stocks_frame.grid(row=3, column=0, sticky="ew")
+        self._create_top_stocks_panel(top_stocks_frame, self.full_stock_list[:8])
 
-        def draw_gauge(canvas, value):
-            canvas.delete("all")
-            w, h = 200, 120
-            canvas.create_arc(20, 20, w-20, h*1.5, start=0, extent=180, style="arc", outline="#4B5563", width=10)
-            angle = 180 - (value / 100 * 180)
-            color = "#ef4444" if value < 30 else "#f97316" if value < 70 else "#22c55e"
-            canvas.create_arc(20, 20, w-20, h*1.5, start=angle, extent=180-angle, style="arc", outline=color, width=12)
-            canvas.create_text(w/2, h-20, text=f"{value:.0f}", font=("Segoe UI", 24, "bold"), fill="white")
-            label = "Fear" if value < 30 else "Greed" if value > 70 else "Neutral"
-            canvas.create_text(w/2, h-5, text=label, font=("Segoe UI", 12), fill="gray")
-        draw_gauge(gauge_canvas, sentiment_value)
+        news_frame = ctk.CTkScrollableFrame(main_content, fg_color="#1f2937", height=180)
+        news_frame.grid(row=5, column=0, sticky="nsew", pady=(10, 10))
+        self._create_news_feed(news_frame, market_data.get('news', []))
 
-    def _create_watchlist_panel(self, parent):
-        self.watchlist = self.config_manager.get_watchlist()
-        frame = ctk.CTkFrame(parent); frame.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
-        frame.grid_columnconfigure(0, weight=1); frame.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(frame, text="Watchlist", font=("Segoe UI", 18, "bold")).grid(row=0, column=0, sticky="w", padx=15, pady=10)
-        
-        add_frame = ctk.CTkFrame(frame, fg_color="transparent"); add_frame.grid(row=2, column=0, sticky="ew", padx=15, pady=5)
-        self.watchlist_entry = ctk.CTkEntry(add_frame, placeholder_text="Add Ticker"); self.watchlist_entry.pack(side=tk.LEFT, expand=True, fill="x")
-        self.watchlist_entry.bind("<Return>", lambda e: self.add_to_watchlist())
-        ctk.CTkButton(add_frame, text="+", width=30, command=self.add_to_watchlist).pack(side=tk.LEFT, padx=(5,0))
+    def start_rotation(self):
+        self._update_indices_display(); self.after(20000, self.start_rotation)
 
-        self.watchlist_frame = ctk.CTkScrollableFrame(frame, fg_color="transparent")
-        self.watchlist_frame.grid(row=1, column=0, sticky="nsew", padx=15)
-        self.redraw_watchlist()
-        
-    def redraw_watchlist(self):
-        for widget in self.watchlist_frame.winfo_children(): widget.destroy()
-        for ticker in sorted(self.watchlist):
-            item_frame = ctk.CTkFrame(self.watchlist_frame, fg_color="#374151")
-            ctk.CTkLabel(item_frame, text=ticker, font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT, padx=10, pady=5)
-            remove_button = ctk.CTkButton(item_frame, text="x", width=30, fg_color="#be123c", hover_color="#9f1239",
-                                          command=lambda t=ticker: self.remove_from_watchlist(t))
-            remove_button.pack(side=tk.RIGHT, padx=5)
-            item_frame.pack(fill="x", pady=2)
-            
-    def add_to_watchlist(self):
-        ticker = self.watchlist_entry.get().strip().upper()
-        if ticker and ticker not in self.watchlist:
-            self.watchlist.append(ticker)
-            self.config_manager.save_watchlist(self.watchlist)
-            self.redraw_watchlist()
-            self.watchlist_entry.delete(0, tk.END)
+    def _update_indices_display(self):
+        for widget in self.indices_frame.winfo_children(): widget.destroy()
+        count = len(self.full_stock_list)
+        if count > 0:
+            for i in range(3):
+                self.indices_frame.grid_columnconfigure(i, weight=1)
+                idx = (self.rotation_index + i) % count
+                self._create_clickable_card(self.indices_frame, self.full_stock_list[idx], row=0, col=i)
+            self.rotation_index = (self.rotation_index + 3) % count
 
-    def remove_from_watchlist(self, ticker):
-        if ticker in self.watchlist:
-            self.watchlist.remove(ticker)
-            self.config_manager.save_watchlist(self.watchlist)
-            self.redraw_watchlist()
+    def _create_top_stocks_panel(self, parent, stocks_data):
+        if not stocks_data: ctk.CTkLabel(parent, text="Data unavailable.").pack(); return
+        for i in range(4): parent.grid_columnconfigure(i, weight=1)
+        for idx, stock in enumerate(stocks_data):
+            self._create_clickable_card(parent, stock, row=idx // 4, col=idx % 4)
 
-    def _update_movers_display(self, parent, movers_data):
-        frame = ctk.CTkScrollableFrame(parent, label_text="Top Market Movers", label_font=("Segoe UI", 18, "bold"))
-        frame.grid(row=1, column=2, sticky="nsew", padx=(0, 10))
-        content = "Could not load data."
-        if movers_data and movers_data.get('gainers') is not None and movers_data.get('losers') is not None:
-            content = "--- TOP GAINERS ---\n"
-            for ticker, change in movers_data['gainers'].items(): content += f"{ticker:<7} {change:+.2f}%\n"
-            content += "\n--- TOP LOSERS ---\n"
-            for ticker, change in movers_data['losers'].items(): content += f"{ticker:<7} {change:+.2f}%\n"
-        ctk.CTkLabel(frame, text=content, font=("Consolas", 12), justify="left").pack(padx=10, pady=5)
+    def _create_clickable_card(self, parent, stock, row, col):
+        card = ctk.CTkFrame(parent, fg_color="#374151", corner_radius=10, cursor="hand2")
+        card.grid(row=row, column=col, padx=8, pady=8, sticky="ew")
+        def bind_click(widget, ticker):
+            widget.bind("<Button-1>", lambda e: self.launch_analysis_direct(ticker))
+            for child in widget.winfo_children(): bind_click(child, ticker)
+        top = ctk.CTkFrame(card, fg_color="transparent"); top.pack(fill="x", padx=10, pady=(10,5))
+        ctk.CTkLabel(top, text=stock['ticker'], font=("Segoe UI", 20, "bold")).pack(side="left")
+        color = "#4ade80" if stock['change'] >= 0 else "#f87171"
+        mid = ctk.CTkFrame(card, fg_color="transparent"); mid.pack(fill="x", padx=10)
+        ctk.CTkLabel(mid, text=f"${stock['price']:.2f}", font=("Segoe UI", 24)).pack(side="left")
+        ctk.CTkLabel(mid, text=f"{stock['change']:+.2f}", text_color=color, font=("Segoe UI", 14, "bold")).pack(side="right")
+        bot = ctk.CTkFrame(card, fg_color="transparent"); bot.pack(fill="x", padx=10, pady=(0,10))
+        ctk.CTkLabel(bot, text=f"Vol: {stock['volume'] / 1e6:.1f}M", text_color="gray", font=("Segoe UI", 11)).pack(side="left")
+        bind_click(card, stock['ticker'])
 
-    def _update_news_display(self, parent, news_data):
-        frame = ctk.CTkScrollableFrame(parent, label_text="Top Financial News", label_font=("Segoe UI", 18, "bold"))
-        frame.grid(row=1, column=3, sticky="nsew", padx=(10, 0))
-        content = "Could not load news."
-        if news_data: content = "\n\n".join([f"• {item}" for item in news_data])
-        ctk.CTkLabel(frame, text=content, font=("Segoe UI", 13), justify="left", wraplength=parent.winfo_width()//4 - 50).pack(padx=10, pady=5)
-    
+    def _create_news_feed(self, parent, news_data):
+        if not news_data: ctk.CTkLabel(parent, text="No news available.").pack(pady=10); return
+        for item in news_data:
+            card = ctk.CTkFrame(parent, fg_color="#111827", corner_radius=8); card.pack(fill="x", pady=4, padx=5)
+            link_lbl = ctk.CTkLabel(card, text=f"{item['date']}  |  {item['title']}", font=("Segoe UI", 13), anchor="w", cursor="hand2", text_color="#e5e7eb")
+            link_lbl.pack(fill="x", padx=10, pady=8)
+            link_lbl.bind("<Button-1>", lambda e, url=item['link']: webbrowser.open(url))
+            link_lbl.bind("<Enter>", lambda e, l=link_lbl: l.configure(text_color="#60a5fa"))
+            link_lbl.bind("<Leave>", lambda e, l=link_lbl: l.configure(text_color="#e5e7eb"))
+
+    def launch_analysis_direct(self, ticker):
+        self.ticker_entry.delete(0, tk.END); self.ticker_entry.insert(0, ticker); self.launch_analysis()
+
     def launch_analysis(self):
         ticker = self.ticker_entry.get().strip().upper()
-        if not ticker: messagebox.showwarning("Input Required", "Please enter a stock ticker to analyze."); return
-        if ticker in self.analysis_windows and self.analysis_windows[ticker].winfo_exists(): self.analysis_windows[ticker].lift(); return
+        if not ticker: messagebox.showwarning("Input Required", "Please enter a stock ticker."); return
+        
+        if ticker in self.analysis_windows and self.analysis_windows[ticker].winfo_exists(): 
+            self.analysis_windows[ticker].lift(); self.analysis_windows[ticker].focus_force(); return
+        
+        try:
+            test_data = yf.Ticker(ticker).history(period="1d")
+            if test_data.empty:
+                messagebox.showerror("Invalid Ticker", f"Could not find market data for symbol: {ticker}\nPlease check the spelling.")
+                return
+        except Exception:
+            messagebox.showerror("Network Error", f"Could not verify ticker: {ticker}")
+            return
+        
         win = AnalysisView(self, self, ticker)
         self.analysis_windows[ticker] = win
         self.data_service.fetch_stock_data_async(ticker, lambda s, d: self.ui_queue.put(("stock_data", (ticker, s, d))))
@@ -573,18 +854,13 @@ class App(ctk.CTk):
             self.analysis_service.run_full_analysis_async(ticker, data['df'], self.ui_queue)
         else: messagebox.showerror("Error", f"Failed to fetch data for {ticker}:\n{data}", parent=win); win.destroy()
     
-    def show_license_info(self):
-        messagebox.showinfo("License Information", f"Product Status: Activated\nProduct Key: {Config.VALID_KEY}", parent=self)
-
     def process_ui_queue(self):
         try:
             while True:
                 msg = self.ui_queue.get_nowait(); msg_type = msg[0]
                 if msg_type.startswith("loading"):
                     if msg_type == "loading_status":
-                        progress_map = {"Fetching market indices...": 0.25, "Fetching sentiment data...": 0.5, "Fetching top market movers...": 0.75, "Fetching financial news...": 0.9}
-                        if hasattr(self, 'loading_view') and self.loading_view.winfo_exists():
-                            self.loading_view.update_progress(progress_map.get(msg[1], 0), msg[1])
+                        if hasattr(self, 'loading_view') and self.loading_view.winfo_exists(): self.loading_view.update_progress(0.5, msg[1])
                     elif msg_type == "loading_done": self.on_market_data_loaded(True, msg[1])
                     elif msg_type == "loading_error": self.on_market_data_loaded(False, msg[1])
                 elif msg_type == "stock_data": _, (ticker, success, data) = msg; self.on_stock_data_loaded(ticker, success, data)
@@ -596,31 +872,13 @@ class App(ctk.CTk):
                         elif analysis_type == "data": setattr(win, f"{payload[0]}_data", payload[1])
                         elif analysis_type == "error": messagebox.showerror("Analysis Error", payload[0], parent=win); win.destroy()
                         elif analysis_type == "done":
-                            win.stop_progress()
-                            ta_summary = (f"RSI (14):      {win.ta_data.get('RSI', float('nan')):.2f}\n"
-                                          f"MACD:          {win.ta_data.get('MACD', float('nan')):.2f}\n"
-                                          f"Signal:        {win.ta_data.get('Signal', float('nan')):.2f}\n"
-                                          f"BBands Upper:  {win.ta_data.get('BBU', float('nan')):.2f}\n"
-                                          f"BBands Lower:  {win.ta_data.get('BBL', float('nan')):.2f}")
-                            pred_summary = "\n".join([f"{n:<18}: ${p:.2f}" for n, p in win.pred_data.items()])
-                            win.update_panel_text(win.ta_text, ta_summary)
-                            win.update_panel_text(win.pred_text, pred_summary)
-                            win.update_panel_text(win.summary_text, win.summary_data)
-                            win.update_chart(win.ta_data)
+                            win.stop_progress(); win.update_consolidated_report(); win.update_chart(win.ta_data)
         except Empty: pass
         self.after(100, self.process_ui_queue)
 
-# =================================================================================================
-# MAIN EXECUTION
-# =================================================================================================
 if __name__ == "__main__":
     try:
         logging.info("================== APPLICATION START ==================")
-        app = App()
-        app.mainloop()
-    except Exception as e:
-        logging.critical(f"A fatal error occurred: {e}", exc_info=True)
-        messagebox.showerror("Fatal Error", f"A critical error occurred:\n\n{traceback.format_exc()}")
-    finally:
-        logging.info("================== APPLICATION END ==================\n")
-
+        app = App(); app.mainloop()
+    except Exception as e: logging.critical(f"A fatal error occurred: {e}", exc_info=True); messagebox.showerror("Fatal Error", f"{traceback.format_exc()}")
+    finally: logging.info("================== APPLICATION END ==================\n")
