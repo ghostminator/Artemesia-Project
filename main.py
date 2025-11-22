@@ -1,5 +1,4 @@
 import os
-import base64
 # --- 1. Silence TensorFlow & Protobuf Warnings ---
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -25,6 +24,8 @@ import random
 import concurrent.futures
 import webbrowser
 from datetime import datetime
+import hmac
+import hashlib
 
 # --- Library Import & Setup ---
 warnings.filterwarnings("ignore")
@@ -80,18 +81,32 @@ except ImportError as e:
 # CONFIGURATION & SECURITY
 # =================================================================================================
 class Config:
-    VALID_KEY = "ARTEMIS-2025"
     APP_NAME = "Artemis Engine"
     CONFIG_FILE = "artemis.cfg"
+    TOKEN_FILE = "token.txt"
     
-    # --- ENCRYPTED TOKEN STORAGE ---
-    _ENC_TOKEN = "Z2l0aHViX3BhdF8xMUJHTlJENlkwQU9yUWw1OXVUdnVmX0R6UXNDNllUSXZxeUdiSTZHMGZjWXZsM1I2TGtyOW1zOXdjNkxBTXRqS0hLREU2UjdUQkJsN1VybHpM"
-    
+    # --- LICENSE SECURITY ---
+    LICENSE_FILE = "license.key"
+    SECRET_KEY = b"your-very-secret-key"  # From Admin Generator
+    LICENSE_PAYLOAD = b"licensed-user"    # From Admin Generator
+
     @staticmethod
     def get_ai_token():
+        """Reads the API token from a local file named 'token.txt'."""
         try:
-            return base64.b64decode(Config._ENC_TOKEN).decode('utf-8')
-        except Exception:
+            if os.path.exists(Config.TOKEN_FILE):
+                with open(Config.TOKEN_FILE, 'r') as f:
+                    token = f.read().strip()
+                    if token:
+                        return token
+                    else:
+                        logging.warning(f"{Config.TOKEN_FILE} is empty.")
+                        return ""
+            else:
+                logging.warning(f"{Config.TOKEN_FILE} not found. AI features will be disabled.")
+                return ""
+        except Exception as e:
+            logging.error(f"Error reading token file: {e}")
             return ""
 
     # Expanded Pool of Stocks
@@ -143,27 +158,19 @@ class ConfigManager:
             self._create_default_config()
         else:
             self.config.read(Config.CONFIG_FILE)
-            self._repair_config() # FIX: Repair old config files
+            self._repair_config()
 
     def _create_default_config(self):
-        self.config['LICENSE'] = {'activated': 'false'}
         self.config['USER'] = {'default_broker': ''}
         self.save()
 
     def _repair_config(self):
-        # Self-healing: If keys are missing from old versions, add them
         changed = False
         if 'USER' not in self.config:
             self.config['USER'] = {'default_broker': ''}
             changed = True
-        if 'LICENSE' not in self.config:
-            self.config['LICENSE'] = {'activated': 'false'}
-            changed = True
         if changed: self.save()
 
-    def is_activated(self): return self.config.getboolean('LICENSE', 'activated', fallback=False)
-    def set_activated(self): self.config.set('LICENSE', 'activated', 'true'); self.save()
-    
     def get_broker(self): return self.config.get('USER', 'default_broker', fallback='')
     def set_broker(self, url): self.config.set('USER', 'default_broker', url); self.save()
     def clear_broker(self): self.config.set('USER', 'default_broker', ''); self.save()
@@ -171,6 +178,29 @@ class ConfigManager:
     def save(self):
         with open(Config.CONFIG_FILE, 'w') as configfile:
             self.config.write(configfile)
+
+    # --- LICENSE METHODS ---
+    def get_stored_license(self):
+        if os.path.exists(Config.LICENSE_FILE):
+            try:
+                with open(Config.LICENSE_FILE, "r") as f:
+                    return f.read().strip()
+            except Exception: pass
+        return ""
+
+    def save_license(self, key):
+        with open(Config.LICENSE_FILE, "w") as f:
+            f.write(key.strip())
+
+    def clear_license(self):
+        if os.path.exists(Config.LICENSE_FILE):
+            os.remove(Config.LICENSE_FILE)
+
+    def validate_license(self, key):
+        if not key: return False
+        # Calculate expected key based on secret and payload
+        expected = hmac.new(Config.SECRET_KEY, Config.LICENSE_PAYLOAD, hashlib.sha256).hexdigest().upper()
+        return hmac.compare_digest(key.strip().upper(), expected)
 
 # =================================================================================================
 # SERVICES (DATA & LOGIC LAYER)
@@ -186,7 +216,7 @@ class AIService:
             return
 
         if not self.token:
-            self.init_error = "Decryption failed or Token empty."
+            self.init_error = "Token missing. Ensure 'token.txt' exists with your key."
             return
 
         try:
@@ -201,7 +231,7 @@ class AIService:
 
     def generate_insight(self, ticker, context_data):
         if self.init_error or not self.client:
-            return "AI Service Unavailable. Check configuration."
+            return f"AI Service Unavailable. {self.init_error if self.init_error else 'Check configuration.'}"
         
         system_prompt = f"""You are Artemis, a senior institutional trading analyst.
         Analyze the provided stock data deeply.
@@ -449,6 +479,78 @@ class BaseWindow(ctk.CTkToplevel):
         try: self.iconbitmap('icon.ico')
         except Exception: pass
     def _on_close(self): self.destroy()
+
+class LicenseActivationView(BaseWindow):
+    def __init__(self, master, config_manager, on_success):
+        super().__init__(master)
+        self.title("Product Activation"); self.geometry("400x250"); self.resizable(False, False)
+        self.config_manager = config_manager
+        self.on_success = on_success
+        self.protocol("WM_DELETE_WINDOW", self._on_exit)
+        
+        self.grid_columnconfigure(0, weight=1)
+        
+        ctk.CTkLabel(self, text="Artemis Engine Activation", font=("Segoe UI", 20, "bold")).grid(row=0, column=0, pady=(20, 10))
+        ctk.CTkLabel(self, text="Please enter your product key to continue.", font=("Segoe UI", 12)).grid(row=1, column=0, pady=5)
+        
+        self.key_entry = ctk.CTkEntry(self, placeholder_text="XXXX-XXXX-XXXX-XXXX", width=300, justify="center")
+        self.key_entry.grid(row=2, column=0, pady=15)
+        
+        self.activate_btn = ctk.CTkButton(self, text="Activate", width=150, command=self.activate)
+        self.activate_btn.grid(row=3, column=0, pady=10)
+        
+        self.status_lbl = ctk.CTkLabel(self, text="", text_color="red", font=("Segoe UI", 11))
+        self.status_lbl.grid(row=4, column=0)
+
+        self.grab_set() # Make modal
+
+    def activate(self):
+        key = self.key_entry.get().strip()
+        if self.config_manager.validate_license(key):
+            self.config_manager.save_license(key)
+            self.status_lbl.configure(text="Activation Successful!", text_color="green")
+            self.after(1000, self._finish)
+        else:
+            self.status_lbl.configure(text="Invalid Product Key. Please try again.", text_color="red")
+
+    def _finish(self):
+        self.grab_release()
+        self.destroy()
+        self.on_success()
+
+    def _on_exit(self):
+        sys.exit(0)
+
+class LicenseInfoView(BaseWindow):
+    def __init__(self, master, config_manager, restart_callback):
+        super().__init__(master); self.title("License Information"); self.geometry("400x300")
+        self.config_manager = config_manager
+        self.restart_callback = restart_callback
+        self.lift(); self.focus_force(); self.grab_set()
+        
+        ctk.CTkLabel(self, text="License Details", font=("Segoe UI", 18, "bold")).pack(pady=20)
+        
+        current_key = self.config_manager.get_stored_license()
+        masked_key = current_key[:8] + "*" * (len(current_key)-12) + current_key[-4:] if len(current_key) > 12 else "****************"
+        
+        info_frame = ctk.CTkFrame(self, fg_color="#1f2937")
+        info_frame.pack(pady=10, padx=20, fill="x")
+        
+        ctk.CTkLabel(info_frame, text="Status:", font=("Segoe UI", 12, "bold")).pack(side="left", padx=10, pady=10)
+        ctk.CTkLabel(info_frame, text="ACTIVATED", text_color="#4ade80", font=("Segoe UI", 12, "bold")).pack(side="right", padx=10, pady=10)
+        
+        key_frame = ctk.CTkFrame(self, fg_color="transparent")
+        key_frame.pack(pady=5)
+        ctk.CTkLabel(key_frame, text="Product Key:", font=("Segoe UI", 12)).pack(pady=2)
+        ctk.CTkLabel(key_frame, text=masked_key, font=("Consolas", 12), text_color="gray").pack(pady=2)
+        
+        ctk.CTkButton(self, text="Change Product Key", fg_color="#b91c1c", hover_color="#991b1b", command=self.change_key).pack(pady=30)
+
+    def change_key(self):
+        if messagebox.askyesno("Change Key", "Changing the key will require re-activation. Continue?"):
+            self.config_manager.clear_license()
+            self.destroy()
+            self.restart_callback()
 
 class LoadingView(BaseWindow):
     def __init__(self, master):
@@ -726,11 +828,33 @@ class App(ctk.CTk):
         self.ui_queue = Queue(); self.after(100, self.process_ui_queue)
         self.analysis_windows = {}
         self.full_stock_list = []; self.rotation_index = 0
-        self.withdraw(); self.show_loading_screen()
+        self.withdraw()
+        
+        # --- LICENSE CHECK ---
+        self.check_license()
+
+    def check_license(self):
+        current_key = self.config_manager.get_stored_license()
+        if self.config_manager.validate_license(current_key):
+            self.show_loading_screen()
+        else:
+            self.show_activation_screen()
+
+    def show_activation_screen(self):
+        LicenseActivationView(self, self.config_manager, self.show_loading_screen)
 
     def show_loading_screen(self):
         self.loading_view = LoadingView(self)
         self.data_service.fetch_market_data_async(self.ui_queue)
+
+    def show_license_info(self):
+        LicenseInfoView(self, self.config_manager, self.restart_app)
+
+    def restart_app(self):
+        self.withdraw()
+        if hasattr(self, 'loading_view') and self.loading_view.winfo_exists(): self.loading_view.destroy()
+        for win in self.analysis_windows.values(): win.destroy()
+        self.check_license()
 
     def on_market_data_loaded(self, success, data):
         if success: 
@@ -739,7 +863,8 @@ class App(ctk.CTk):
         else: messagebox.showerror("Error", f"Failed to load market data:\n{data}"); self.destroy()
 
     def show_dashboard(self, market_data):
-        self.loading_view.destroy(); self.state("zoomed"); self.deiconify()
+        if hasattr(self, 'loading_view') and self.loading_view.winfo_exists(): self.loading_view.destroy()
+        self.state("zoomed"); self.deiconify()
         self.grid_columnconfigure(0, weight=1); self.grid_rowconfigure(1, weight=1)
         self.bg_canvas = tk.Canvas(self, bg="#111827", highlightthickness=0); self.bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
         self.animation = BackgroundAnimation(self.bg_canvas)
@@ -754,6 +879,9 @@ class App(ctk.CTk):
         self.google_entry = ctk.CTkEntry(search_frame, placeholder_text="Google Search...", width=200)
         self.google_entry.pack(side="left", padx=5)
         self.google_entry.bind("<Return>", lambda e: webbrowser.open(f"https://www.google.com/search?q={self.google_entry.get()}"))
+        
+        # License Button
+        ctk.CTkButton(search_frame, text="License", width=80, fg_color="#374151", command=self.show_license_info).pack(side="left", padx=5)
         
         ctk.CTkButton(search_frame, text="?", width=40, command=lambda: HelpWindow(self)).pack(side="left", padx=5)
         
