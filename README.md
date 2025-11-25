@@ -69,8 +69,11 @@ Project Structure
 Disclaimer
 Not Financial Advice.
 The Artemis Engine is a research and analysis tool. The predictions, indicators, and AI-generated reports provided by this software are for informational purposes only and should not be considered financial advice. Always conduct your own due diligence before making investment decisions.
+
+
 License
 Copyright © 2025. All Rights Reserved.
 Unauthorized copying, modification, distribution, or use of this software is strictly prohibited.
+
 
 
